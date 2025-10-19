@@ -1,0 +1,660 @@
+name: Build Llama.cpp + ROCm
+on:
+  workflow_dispatch:
+
+env:
+  OPERATING_SYSTEMS: 'ubuntu'
+  GFX_TARGETS: 'gfx1151'
+  ROCM_VERSION: ${{ github.event.inputs.rocm_version || 'latest' }}
+  LLAMACPP_VERSION: ${{ github.event.inputs.llamacpp_version || 'latest' }}
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-22.04
+    outputs:
+      ubuntu_matrix: ${{ steps.set-matrix.outputs.ubuntu_matrix }}
+      should_build_ubuntu: ${{ steps.set-matrix.outputs.should_build_ubuntu }}
+    steps:
+    - name: Set matrix
+      id: set-matrix
+      run: |
+        targets="${{ env.GFX_TARGETS }}"
+        operating_systems="${{ env.OPERATING_SYSTEMS }}"
+        
+        echo "Input targets: $targets"
+        echo "Input operating systems: $operating_systems"
+
+        # Convert targets to JSON array
+        matrix_targets=$(echo "$targets" \
+          | tr ',' '\n' \
+          | sed 's/^ *//;s/ *$//' \
+          | sed 's/^"//;s/"$//' \
+          | jq -R . \
+          | jq -s '{gfx_target: .}' \
+          | jq -c)
+
+        # Check which operating systems to build
+        should_build_ubuntu="false"
+        
+        if [[ "$operating_systems" == *"ubuntu"* ]]; then
+          should_build_ubuntu="true"
+          echo "ubuntu_matrix=$matrix_targets" >> $GITHUB_OUTPUT
+        fi
+        
+        echo "should_build_ubuntu=$should_build_ubuntu" >> $GITHUB_OUTPUT
+        
+        echo "Ubuntu build: $should_build_ubuntu"
+        echo "Generated matrix: $matrix_targets"
+
+  build-ubuntu:
+    runs-on: ubuntu-22.04
+    needs: prepare-matrix
+    if: needs.prepare-matrix.outputs.should_build_ubuntu == 'true'
+    strategy:
+      matrix: ${{fromJson(needs.prepare-matrix.outputs.ubuntu_matrix)}}
+      fail-fast: false
+    outputs:
+      rocm_version: ${{ steps.set-outputs.outputs.rocm_version }}
+      llamacpp_commit_hash: ${{ steps.set-outputs.outputs.llamacpp_commit_hash }}
+
+
+    steps:
+    - name: Free disk space
+      # Remove unused runner files to free up disk space
+      run: curl -fsSL https://raw.githubusercontent.com/kou/arrow/e49d8ae15583ceff03237571569099a6ad62be32/ci/scripts/util_free_space.sh | bash
+    
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Clean up existing directories (safety precaution)
+      run: |
+        # Remove existing llama.cpp directory if it exists
+        if [ -d "llama.cpp" ]; then
+          echo "Removing existing llama.cpp directory..."
+          rm -rf llama.cpp
+        fi
+        
+        # Remove existing /opt/rocm directory if it exists
+        if [ -d "/opt/rocm" ]; then
+          echo "Removing existing /opt/rocm directory..."
+          sudo rm -rf /opt/rocm
+        fi
+        
+        # Remove any existing ROCm tarball
+        if [ -f "rocm.tar.gz" ]; then
+          echo "Removing existing rocm.tar.gz..."
+          rm -f rocm.tar.gz
+        fi
+        
+        echo "Cleanup completed successfully"
+
+    - name: Install build dependencies
+      run: |
+        echo "Installing build dependencies..."
+        sudo apt update
+        sudo apt install -y cmake ninja-build unzip curl
+        
+        # Verify installations
+        echo "Verifying installations..."
+        cmake --version
+        ninja --version
+        echo "Build dependencies installation completed"
+            
+    - name: Download and extract ROCm directly to /opt/rocm
+      run: |
+        # Determine ROCm version to use
+        rocm_version="${{ env.ROCM_VERSION }}"
+        current_target="${{ matrix.gfx_target }}"
+        
+        # Add appropriate suffixes for different GPU targets
+        s3_target="$current_target"
+        if [ "$current_target" = "gfx110X" ]; then
+          s3_target="${current_target}-dgpu"
+          echo "Using S3 target with -dgpu suffix: $s3_target"
+        elif [ "$current_target" = "gfx120X" ]; then
+          s3_target="${current_target}-all"
+          echo "Using S3 target with -all suffix: $s3_target"
+        fi
+        
+        if [ "$rocm_version" = "latest" ]; then
+          echo "Auto-detecting latest ROCm version for target: $current_target"
+          s3_response=$(curl -s "https://therock-nightly-tarball.s3.amazonaws.com/?prefix=therock-dist-linux-${s3_target}-7")
+          latest_file=$(echo "$s3_response" | grep -oP '(?<=<Key>)[^<]*' | grep "therock-dist-linux-${s3_target}-" | sort | tail -n 1)
+          
+          echo "Found latest file: $latest_file"
+          
+          # Extract version from the filename for environment variable
+          if [[ "$latest_file" =~ therock-dist-linux-${s3_target}-.*?([0-9]+\.[0-9]+\.[0-9]+rc[0-9]+)\.tar\.gz ]]; then
+            rocm_version="${BASH_REMATCH[1]}"
+            echo "Detected latest ROCm version: $rocm_version"
+          else
+            echo "Failed to extract ROCm version from latest file: $latest_file"
+            echo "Expected pattern: therock-dist-linux-${s3_target}-*<version>.tar.gz"
+            exit 1
+          fi
+          
+          # Use the exact filename from S3 instead of reconstructing
+          rocm_url="https://therock-nightly-tarball.s3.amazonaws.com/$latest_file"
+        else
+          # For specific versions, construct the URL as before
+          rocm_url="https://therock-nightly-tarball.s3.amazonaws.com/therock-dist-linux-${s3_target}-${rocm_version}.tar.gz"
+        fi
+        
+        # Store the version for use in other steps
+        echo "DETECTED_ROCM_VERSION=$rocm_version" >> $GITHUB_ENV
+        
+        echo "Streaming ROCm from: $rocm_url directly to extraction"
+        
+        # Create directory if it doesn't exist
+        sudo mkdir -p /opt/rocm
+        
+        # Stream download directly into tar extraction (no intermediate file)
+        curl -sL "$rocm_url" | sudo tar --use-compress-program=gzip -xf - -C /opt/rocm --strip-components=1
+        
+    - name: Set ROCm environment variables
+      run: |
+        echo "Setting ROCm environment variables..."
+        
+        # Set environment variables for this step and subsequent steps
+        echo "HIP_PATH=/opt/rocm" >> $GITHUB_ENV
+        echo "ROCM_PATH=/opt/rocm" >> $GITHUB_ENV
+        echo "HIP_PLATFORM=amd" >> $GITHUB_ENV
+        echo "HIP_CLANG_PATH=/opt/rocm/llvm/bin" >> $GITHUB_ENV
+        echo "HIP_INCLUDE_PATH=/opt/rocm/include" >> $GITHUB_ENV
+        echo "HIP_LIB_PATH=/opt/rocm/lib" >> $GITHUB_ENV
+        echo "HIP_DEVICE_LIB_PATH=/opt/rocm/lib/llvm/amdgcn/bitcode" >> $GITHUB_ENV
+        
+        # Update PATH
+        echo "/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH" >> $GITHUB_PATH
+        
+        # Set library paths
+        echo "LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:/opt/rocm/llvm/lib:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+        echo "LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:${LIBRARY_PATH:-}" >> $GITHUB_ENV
+        echo "CPATH=/opt/rocm/include:${CPATH:-}" >> $GITHUB_ENV
+        echo "PKG_CONFIG_PATH=/opt/rocm/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> $GITHUB_ENV
+        
+        echo "ROCm environment variables set successfully"
+        
+    #- name: Install rocWMMA headers (develop)
+    #  run: |
+    #    set -e
+    #    TMP_DIR="$(mktemp -d)"
+    #    echo "Using temp directory: $TMP_DIR"
+    #    git clone --depth 1 --single-branch --branch develop https://github.com/ROCm/rocWMMA.git "$TMP_DIR/rocWMMA"
+    #    SRC_DIR="$TMP_DIR/rocWMMA/library/include/rocwmma"
+    #    if [ ! -d "$SRC_DIR" ]; then
+    #      echo "rocWMMA headers not found at expected path: $SRC_DIR"
+    #      exit 1
+    #    fi
+    #    echo "Installing headers to /opt/rocm/include/rocwmma ..."
+    #    sudo mkdir -p /opt/rocm/include
+    #    sudo rm -rf /opt/rocm/include/rocwmma
+    #    sudo cp -r "$SRC_DIR" /opt/rocm/include/
+    #    rm -rf "$TMP_DIR"
+    #    echo "rocWMMA headers (develop) installed successfully."
+        
+    - name: Clone llama.cpp
+      run: |
+        llamacpp_version="${{ env.LLAMACPP_VERSION }}"
+        if [ "$llamacpp_version" = "latest" ]; then
+          echo "Cloning master branch (latest) with shallow clone"
+          git clone --depth 1 --single-branch --branch master https://github.com/ggerganov/llama.cpp.git
+        else
+          echo "Cloning llama.cpp version: $llamacpp_version with shallow clone"
+          git clone --depth 1 --single-branch --branch "$llamacpp_version" https://github.com/ggerganov/llama.cpp.git
+        fi
+        cd llama.cpp
+        
+        # Get commit hash (5 digits) and store it as environment variable
+        commit_hash=$(git rev-parse --short=5 HEAD)
+        echo "LLAMACPP_COMMIT_HASH=$commit_hash" >> $GITHUB_ENV
+        echo "llama.cpp commit hash (5 digits): $commit_hash"
+        
+        # Show current commit info
+        echo "Current llama.cpp commit:"
+        git log --oneline -1
+        
+    - name: Update HIP version check
+      run: |
+        cd llama.cpp
+        hip_file="ggml/src/ggml-cuda/vendors/hip.h"
+        if [ -f "$hip_file" ]; then
+          sed -i 's/HIP_VERSION >= 70000000/HIP_VERSION >= 50600000/g' "$hip_file"
+          echo "Updated HIP version check in $hip_file"
+        else
+          echo "Warning: $hip_file not found"
+        fi
+
+    #- name: Apply rocWMMA patch (non-interactive)
+    #  run: |
+    #    chmod +x utils/rocwmma_patch.sh
+    #    # Run non-interactively; keep backups (answer 'n')
+    #    printf "n\n" | ./utils/rocwmma_patch.sh ./llama.cpp
+        
+    - name: Build Llama.cpp + ROCm
+      run: |
+        # Map GPU targets
+        current_target="${{ matrix.gfx_target }}"
+        echo "Input target: $current_target"
+        
+        if [ "$current_target" = "gfx110X" ]; then
+          mapped_target="gfx1100"
+        elif [ "$current_target" = "gfx1151" ]; then
+          mapped_target="gfx1151"
+        elif [ "$current_target" = "gfx120X" ]; then
+          mapped_target="gfx1200,gfx1201"
+        else
+          mapped_target="$current_target"
+        fi
+        echo "Mapped target: $mapped_target"
+
+        # Create build directory
+        cd llama.cpp
+        mkdir build
+        cd build
+
+        # Configure the project
+        cmake .. -G Ninja \
+          -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
+          -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
+          -DCMAKE_CROSSCOMPILING=ON \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DAMDGPU_TARGETS="$mapped_target" \
+          -DBUILD_SHARED_LIBS=ON \
+          -DLLAMA_BUILD_TESTS=OFF \
+          -DGGML_HIP=ON \
+          -DGGML_OPENMP=OFF \
+          -DGGML_CUDA_FORCE_CUBLAS=OFF \
+          -DGGML_HIP_ROCWMMA_FATTN=OFF \
+          -DGGML_HIP_FORCE_ROCWMMA_FATTN_GFX12=OFF \
+          -DLLAMA_CURL=OFF \
+          -DGGML_NATIVE=OFF \
+          -DGGML_STATIC=OFF \
+          -DCMAKE_SYSTEM_NAME=Linux
+
+        # Build the project
+        cmake --build . -j $(nproc)
+        
+    - name: Copy ROCm core libs to build directory
+      run: |
+        build_bin_path="llama.cpp/build/bin"
+        rocm_bin_path="/opt/rocm/bin"
+        
+        # Copy the rocblas/library folder and all its contents
+        rocblas_lib_path="/opt/rocm/lib/rocblas/library"
+        if [ -d "$rocblas_lib_path" ]; then
+          echo "Copying rocblas/library folder and all contents..."
+          dest_rocblas_path="$build_bin_path/rocblas/library"
+          mkdir -p "$(dirname "$dest_rocblas_path")"
+          cp -r "$rocblas_lib_path" "$(dirname "$dest_rocblas_path")/"
+          echo "Copied: rocblas/library folder with all contents"
+          
+          # List the contents of the copied rocblas/library folder
+          echo "Contents of rocblas/library:"
+          find "$dest_rocblas_path" -type f -exec ls -la {} \; | head -20
+        else
+          echo "Warning: rocblas/library folder not found at: $rocblas_lib_path"
+        fi
+ 
+        # Copy required ROCm libraries to build directory
+        # If artifacts from ROCm or Llama.cpp change, you may need to update this list
+        # To get a new list of all libraries, run:
+        # gather_required_libs.py --rocm-dir /opt/rocm --dest-dir llama.cpp/build/bin
+        echo "Copying required ROCm libraries to build directory..."
+        cp -v /opt/rocm/lib/libhipblas.so* "$build_bin_path/" 2>/dev/null || echo "libhipblas.so* not found"
+        cp -v /opt/rocm/lib/librocblas.so* "$build_bin_path/" 2>/dev/null || echo "librocblas.so* not found"
+        cp -v /opt/rocm/lib/libamdhip64.so* "$build_bin_path/" 2>/dev/null || echo "libamdhip64.so* not found"
+        cp -v /opt/rocm/lib/librocsolver.so* "$build_bin_path/" 2>/dev/null || echo "librocsolver.so* not found"
+        cp -v /opt/rocm/lib/libroctx64.so* "$build_bin_path/" 2>/dev/null || echo "libroctx64.so* not found"
+        cp -v /opt/rocm/lib/libhipblaslt.so* "$build_bin_path/" 2>/dev/null || echo "libhipblaslt.so* not found"
+        cp -v /opt/rocm/lib/librocprofiler-register.so* "$build_bin_path/" 2>/dev/null || echo "librocprofiler-register.so* not found"
+        cp -v /opt/rocm/lib/libamd_comgr.so* "$build_bin_path/" 2>/dev/null || echo "libamd_comgr.so* not found"
+        cp -v /opt/rocm/lib/libamd_comgr_loader.so* "$build_bin_path/" 2>/dev/null || echo "libamd_comgr_loader.so* not found"
+        cp -v /opt/rocm/lib/libhsa-runtime64.so* "$build_bin_path/" 2>/dev/null || echo "libhsa-runtime64.so* not found"
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_numa.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_numa.so* not found"
+        cp -v /opt/rocm/lib/librocroller.so* "$build_bin_path/" 2>/dev/null || echo "librocroller.so* not found"
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_z.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_z.so* not found"
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_zstd.so* not found"
+        cp -v /opt/rocm/lib/llvm/lib/libLLVM.so* "$build_bin_path/" 2>/dev/null || echo "libLLVM.so* not found"
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_elf.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_elf.so* not found"
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_drm.so* not found"
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_drm_amdgpu.so* not found"
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_bz2.so* "$build_bin_path/" 2>/dev/null || echo "librocm_sysdeps_bz2.so* not found"
+
+        echo "Finished copying required ROCm libraries"
+        
+    - name: List build artifacts (including ROCm files)
+      run: |
+        cd llama.cpp/build/bin
+        echo "Final build artifacts (including ROCm library files):"
+        ls -la
+        
+    - name: Upload build artifacts
+      id: upload-artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: llama-ubuntu-rocm-${{ matrix.gfx_target }}-x64
+        path: llama.cpp/build/bin/
+        retention-days: 30
+        
+    - name: Set job outputs
+      id: set-outputs
+      run: |
+        echo "Setting job outputs..."
+        echo "Current target: ${{ matrix.gfx_target }}"
+        echo "DETECTED_ROCM_VERSION: ${DETECTED_ROCM_VERSION}"
+        echo "ROCM_VERSION: ${{ env.ROCM_VERSION }}"
+        echo "LLAMACPP_COMMIT_HASH: ${LLAMACPP_COMMIT_HASH}"
+        
+        rocm_version="${DETECTED_ROCM_VERSION:-${{ env.ROCM_VERSION }}}"
+        echo "rocm_version=$rocm_version" >> $GITHUB_OUTPUT
+        echo "llamacpp_commit_hash=${LLAMACPP_COMMIT_HASH}" >> $GITHUB_OUTPUT
+        
+        echo "Final rocm_version: $rocm_version"
+        echo "Final llamacpp_commit_hash: ${LLAMACPP_COMMIT_HASH}"
+        
+    - name: Create release summary
+      run: |
+        cat > "build-summary-ubuntu-${{ matrix.gfx_target }}.md" << 'EOF'
+        # Llama.cpp + ROCm Build Summary (Ubuntu - ${{ matrix.gfx_target }})
+        
+        ## Build Configuration
+        - **GPU Target**: ${{ matrix.gfx_target }}
+        - **ROCm Version**: ${{ env.DETECTED_ROCM_VERSION || env.ROCM_VERSION }}
+        - **llama.cpp Commit Hash**: ${{ env.LLAMACPP_COMMIT_HASH }}
+        - **Build Type**: Release
+        - **Platform**: Ubuntu
+        
+        ## Build Artifacts
+        The compiled binaries are available in the build artifacts.
+        EOF
+        
+    - name: Upload build summary
+      id: upload-summary
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-summary-ubuntu-${{ matrix.gfx_target }}
+        path: build-summary-ubuntu-${{ matrix.gfx_target }}.md
+        retention-days: 30
+        
+    - name: Clean up build artifacts and temporary files
+      if: always()
+      run: |
+        echo "Starting cleanup process..."
+        
+        # Remove ROCm tarball
+        if [ -f "rocm.tar.gz" ]; then
+          echo "Removing rocm.tar.gz..."
+          rm -f rocm.tar.gz
+        fi
+        
+        # Remove ROCm installation directory
+        if [ -d "/opt/rocm" ]; then
+          echo "Removing /opt/rocm directory..."
+          sudo rm -rf /opt/rocm
+        fi
+        
+        # Remove llama.cpp source directory (keeping only the build artifacts)
+        if [ -d "llama.cpp" ]; then
+          echo "Removing llama.cpp source directory..."
+          rm -rf llama.cpp
+        fi
+        
+        # Clean up any temporary build files
+        if [ -f "build-summary-ubuntu-${{ matrix.gfx_target }}.md" ]; then
+          echo "Removing build-summary-ubuntu-${{ matrix.gfx_target }}.md..."
+          rm -f "build-summary-ubuntu-${{ matrix.gfx_target }}.md"
+        fi
+        
+        echo "Cleanup completed successfully"
+
+  test-ubuntu-gfx1151:
+    runs-on: [stx-halo, Linux]
+    needs: [prepare-matrix, build-ubuntu]
+    if: |
+      needs.build-ubuntu.result == 'success' &&
+      contains(github.event.inputs.gfx_target || 'gfx1151', 'gfx1151') &&
+      needs.prepare-matrix.outputs.should_build_ubuntu == 'true'
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Download build artifacts for gfx1151
+      uses: actions/download-artifact@v4
+      with:
+        name: llama-ubuntu-rocm-gfx1151-x64
+        path: llama-binaries
+        
+    - name: Download test model
+      run: |
+        model_url="https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_0.gguf?download=true"
+        model_path="Qwen3-0.6B-Q4_0.gguf"
+        
+        echo "Downloading test model from: $model_url"
+        curl -L -o "$model_path" "$model_url"
+        
+        # Verify download
+        if [ -f "$model_path" ]; then
+          file_size=$(stat -c%s "$model_path")
+          echo "Model downloaded successfully. Size: $file_size bytes"
+        else
+          echo "Failed to download model"
+          exit 1
+        fi
+        
+    - name: Set up library path
+      run: |
+        # Add the llama-binaries directory to LD_LIBRARY_PATH
+        echo "LD_LIBRARY_PATH=$(pwd)/llama-binaries:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+        
+    - name: Run llama-cli test for gfx1151
+      run: |
+        llama_cli_path="./llama-binaries/llama-cli"
+        model_path="Qwen3-0.6B-Q4_0.gguf"
+        
+        # Make llama-cli executable
+        chmod +x "$llama_cli_path"
+        
+        # Verify llama-cli exists
+        if [ ! -f "$llama_cli_path" ]; then
+          echo "llama-cli not found at: $llama_cli_path"
+          echo "Available files in llama-binaries:"
+          find llama-binaries -type f
+          exit 1
+        fi
+        
+        echo "Running llama-cli test for gfx1151..."
+        echo "Command: $llama_cli_path -m \"$model_path\" -ngl 99 -p \"I believe the meaning of life is\" -st"
+        
+        # Run the command and capture output
+        output=$("$llama_cli_path" -m "$model_path" -ngl 99 -p "I believe the meaning of life is" -st 2>&1)
+        
+        echo "=== LLAMA-CLI OUTPUT ==="
+        echo "$output"
+        echo "=== END OUTPUT ==="
+        
+        # Check for expected outputs
+        if echo "$output" | grep -q "offloaded 29/29 layers to GPU"; then
+          found_gpu_offload=true
+        else
+          found_gpu_offload=false
+        fi
+        
+        if echo "$output" | grep -q "</think>"; then
+          found_think_tag=true
+        else
+          found_think_tag=false
+        fi
+        
+        echo "=== TEST RESULTS ==="
+        echo "Expected 'offloaded 29/29 layers to GPU': $(if [ "$found_gpu_offload" = true ]; then echo 'FOUND'; else echo 'NOT FOUND'; fi)"
+        echo "Expected '</think>' tag: $(if [ "$found_think_tag" = true ]; then echo 'FOUND'; else echo 'NOT FOUND'; fi)"
+        
+        if [ "$found_gpu_offload" = true ] && [ "$found_think_tag" = true ]; then
+          echo "✅ Test PASSED - Both expected outputs found"
+        else
+          echo "❌ Test FAILED - Missing expected outputs"
+          exit 1
+        fi
+
+  create-release:
+    needs: [prepare-matrix, build-ubuntu, test-ubuntu-gfx1151]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      pull-requests: write
+    if: |
+      always() &&
+      (needs.build-ubuntu.result == 'success') &&
+      (needs.test-ubuntu-gfx1151.result == 'success' || needs.test-ubuntu-gfx1151.result == 'skipped') &&
+      (github.event_name == 'workflow_dispatch' && 
+       (github.event.inputs.create_release == 'true' || github.event.inputs.create_release == null) ||
+       github.event_name == 'schedule')
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Download all build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: ./all-artifacts
+        
+    - name: Generate release tag
+      id: generate-tag
+      env:
+        GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+      run: |
+        # Get all existing release tags that match the pattern b####
+        existing_tags=$(gh release list --limit 1000 --json tagName --jq '.[].tagName' | grep -E '^b[0-9]{4}$' | sort -V || echo "")
+        
+        if [ -z "$existing_tags" ]; then
+          # No existing sequential tags found, start with b1000
+          next_number=1000
+          echo "No existing sequential release tags found, starting with b1000"
+        else
+          # Find the highest existing number
+          highest_tag=$(echo "$existing_tags" | tail -n 1)
+          highest_number=$(echo "$highest_tag" | sed 's/^b//')
+          next_number=$((highest_number + 1))
+          echo "Highest existing tag: $highest_tag (number: $highest_number)"
+          echo "Next number will be: $next_number"
+        fi
+        
+        # Format as b#### (4-digit number with leading zeros)
+        TAG=$(printf "b%04d" $next_number)
+        
+        echo "tag=${TAG}" >> $GITHUB_OUTPUT
+        echo "Generated release tag: ${TAG}"
+        
+    - name: Check if tag already exists
+      id: check-tag
+      run: |
+        TAG="${{ steps.generate-tag.outputs.tag }}"
+        
+        # Check if the tag already exists
+        if git ls-remote --tags origin "$TAG" | grep -q "$TAG"; then
+          echo "Tag $TAG already exists, skipping release creation"
+          echo "tag_exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "Tag $TAG does not exist, proceeding with release creation"
+          echo "tag_exists=false" >> $GITHUB_OUTPUT
+        fi
+        
+    - name: Create archives for all target artifacts
+      if: steps.check-tag.outputs.tag_exists == 'false'
+      run: |
+        # Parse targets and operating systems from environment
+        targets="${{ env.GFX_TARGETS }}"
+        operating_systems="${{ env.OPERATING_SYSTEMS }}"
+        TAG="${{ steps.generate-tag.outputs.tag }}"
+        
+        echo "Processing targets: $targets"
+        echo "Processing operating systems: $operating_systems"
+        echo "Using release tag: $TAG"
+        
+        # Create individual archives for each target and OS combination
+        IFS=',' read -ra TARGET_ARRAY <<< "$targets"
+        IFS=',' read -ra OS_ARRAY <<< "$operating_systems"
+        
+        for os in "${OS_ARRAY[@]}"; do
+          os=$(echo "$os" | xargs) # trim whitespace
+          for target in "${TARGET_ARRAY[@]}"; do
+            target=$(echo "$target" | xargs) # trim whitespace
+            echo "Processing OS: $os, target: $target"
+            
+            # Use artifact name to find the directory
+            artifact_name="llama-${os}-rocm-${target}-x64"
+            artifact_dir="./all-artifacts/${artifact_name}"
+            
+            # Create final archive with release tag
+            final_archive_name="llama-${TAG}-${os}-rocm-${target}-x64"
+            
+            if [ -d "$artifact_dir" ]; then
+              echo "Creating archive: ${final_archive_name}.zip"
+              cd "$artifact_dir"
+              zip -r "../../${final_archive_name}.zip" *
+              cd ../../
+            else
+              echo "Warning: Artifact directory not found: $artifact_dir"
+              ls -la ./all-artifacts/
+            fi
+          done
+        done
+        
+        echo "Created archives:"
+        ls -la *.zip
+        
+    - name: Create Release
+      if: steps.check-tag.outputs.tag_exists == 'false'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+      run: |
+        TAG="${{ steps.generate-tag.outputs.tag }}"
+        # Get ROCm version from either Windows or Ubuntu build (whichever succeeded)
+        ROCM_VERSION="${{ needs.build-ubuntu.outputs.rocm_version }}"
+        # Get llama.cpp commit hash from either Windows or Ubuntu build (whichever succeeded)
+        LLAMACPP_COMMIT_HASH="${{ needs.build-ubuntu.outputs.llamacpp_commit_hash }}"
+        targets="${{ env.GFX_TARGETS }}"
+        operating_systems="${{ env.OPERATING_SYSTEMS }}"
+        
+        echo "Creating release with tag: $TAG"
+        echo "GPU Targets: $targets"
+        echo "Operating Systems: $operating_systems"
+        echo "ROCm Version: $ROCM_VERSION"
+        echo "Llama.cpp Commit: $LLAMACPP_COMMIT_HASH"
+        
+        # Verify archives exist
+        ls -la *.zip
+        
+        # Prepare upload files list
+        upload_files=""
+        IFS=',' read -ra TARGET_ARRAY <<< "$targets"
+        IFS=',' read -ra OS_ARRAY <<< "$operating_systems"
+        
+        for os in "${OS_ARRAY[@]}"; do
+          os=$(echo "$os" | xargs) # trim whitespace
+          for target in "${TARGET_ARRAY[@]}"; do
+            target=$(echo "$target" | xargs) # trim whitespace
+            final_archive_name="llama-${TAG}-${os}-rocm-${target}-x64"
+            if [ -f "${final_archive_name}.zip" ]; then
+              upload_files="${upload_files} ${final_archive_name}.zip"
+            fi
+          done
+        done
+        
+        echo "Files to upload: $upload_files"
+        
+        # Create release with GitHub CLI
+        gh release create "$TAG" \
+          --title "$TAG" \
+          --notes "**Build Number**: $TAG
+        **Operating System(s)**: $operating_systems
+        **GPU Target(s)**: $targets
+        **ROCm Version**: $ROCM_VERSION
+        **Llama.cpp Commit Hash**: $LLAMACPP_COMMIT_HASH
+        **Build Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+        This release includes compiled llama.cpp binaries with ROCm support for multiple GPU targets and operating systems, with all essential ROCm runtime libraries included." \
+          $upload_files
