@@ -270,6 +270,8 @@ jobs:
           -DLLAMA_CURL=OFF \
           -DGGML_NATIVE=OFF \
           -DGGML_STATIC=OFF \
+          -DGGML_RPC=ON \
+          -DGGML_CUDA_ENABLE_UNIFIED_MEMORY=1 \
           -DCMAKE_SYSTEM_NAME=Linux
 
         # Build the project
