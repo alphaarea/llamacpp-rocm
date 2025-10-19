@@ -1,4 +1,4 @@
-name: Build Llama.cpp + ROCm
+name: ubuntu gfx1151 only
 on:
   workflow_dispatch:
 
