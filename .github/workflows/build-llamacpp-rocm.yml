@@ -311,6 +311,7 @@ jobs:
           -DLLAMA_CURL=OFF \
           -DGGML_NATIVE=OFF \
           -DGGML_STATIC=OFF \
+          -DGGML_RPC=ON \
           -DCMAKE_SYSTEM_NAME=Linux
 
         # Build the project
